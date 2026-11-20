@@ -41,6 +41,9 @@ func (app *App) Start(ctx context.Context, options StartOptions) (*Task, error) 
 	if err != nil {
 		return nil, err
 	}
+	if options.AgentTimeout < 0 {
+		return nil, errors.New("--agent-timeout cannot be negative")
+	}
 	now := app.Now().UTC()
 	id := makeTaskID(options.Name, options.Request, now)
 	if _, err := os.Stat(statePath(repo.CommonDir, id)); err == nil {
@@ -48,9 +51,22 @@ func (app *App) Start(ctx context.Context, options StartOptions) (*Task, error) 
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect task state: %w", err)
 	}
+	release, err := acquireTaskLock(repo.CommonDir, id)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if _, err := os.Stat(statePath(repo.CommonDir, id)); err == nil {
+		return nil, fmt.Errorf("task %q already exists", id)
+	}
+	if dirty, _ := gitOutput(repo.Root, "--no-optional-locks", "status", "--porcelain", "--untracked-files=no"); dirty != "" {
+		fmt.Fprintln(app.Out, "Note: uncommitted changes in your working tree are not copied; the task starts from the base commit.")
+	}
 	fmt.Fprintf(app.Out, "Creating isolated worktree for %s...\n", id)
 	branch, worktree, baseCommit, err := createWorktree(repo, id, options.Base, options.WorktreeRoot)
 	if err != nil {
+		release()
+		os.Remove(taskDir(repo.CommonDir, id))
 		return nil, err
 	}
 	base := options.Base
@@ -77,6 +93,7 @@ func (app *App) Start(ctx context.Context, options StartOptions) (*Task, error) 
 		CodexBin:      codexBin,
 		Checks:        append([]string(nil), options.Checks...),
 		CheckTimeout:  options.CheckTimeout,
+		AgentTimeout:  options.AgentTimeout,
 		MaxRejections: options.MaxRejections,
 		CreatedAt:     now,
 		UpdatedAt:     now,
@@ -135,7 +152,9 @@ func (app *App) Resume(ctx context.Context, task *Task, feedback string) error {
 			return errors.New("plan revision requires --feedback")
 		}
 		return app.plan(ctx, task, feedback)
-	case StatusPaused:
+	case StatusPaused, StatusPlanning, StatusRunning:
+		// Planning or running here means the previous duet process died
+		// mid-step (the CLI holds the task lock, so no other process owns it).
 		if task.PlanApprovedAt == nil {
 			return app.plan(ctx, task, feedback)
 		}
@@ -484,6 +503,13 @@ func (app *App) PrintStatus(task *Task) {
 	if task.PauseReason != "" {
 		fmt.Fprintf(app.Out, "pause: %s\n", task.PauseReason)
 	}
+	if task.Status == StatusPlanning || task.Status == StatusRunning {
+		if pid, alive := taskLockHolder(task.GitCommonDir, task.ID); alive {
+			fmt.Fprintf(app.Out, "in progress: duet process %d is working on this task\n", pid)
+		} else {
+			fmt.Fprintf(app.Out, "interrupted: no duet process is working on this task; continue with\n  duet resume %s\n", task.ID)
+		}
+	}
 	if task.Status == StatusAwaitingPlanApproval {
 		app.printPlan(task)
 	}
@@ -549,6 +575,34 @@ func LoadTask(repoPath, id string) (*Task, error) {
 		return nil, err
 	}
 	return loadTask(repo.CommonDir, id)
+}
+
+// LockTask takes the task lock and then loads the task, so the loaded state
+// cannot be changed by another duet process until release is called.
+func LockTask(repoPath, id string) (*Task, func(), error) {
+	repo, err := discoverRepository(repoPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !validTaskID.MatchString(id) {
+		return nil, nil, fmt.Errorf("invalid task ID %q", id)
+	}
+	if _, err := os.Stat(statePath(repo.CommonDir, id)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("task %q does not exist", id)
+		}
+		return nil, nil, fmt.Errorf("read task state: %w", err)
+	}
+	release, err := acquireTaskLock(repo.CommonDir, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	task, err := loadTask(repo.CommonDir, id)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return task, release, nil
 }
 
 func ListTasks(repoPath string) ([]*Task, error) {

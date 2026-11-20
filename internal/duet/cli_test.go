@@ -101,15 +101,25 @@ printf '{"type":"thread.started","thread_id":"%s"}\n' "$thread"
 	if len(lines) != 6 {
 		t.Fatalf("Codex invocation count = %d\n%s", len(lines), invocations)
 	}
-	assertContainsAll(t, lines[0], "exec --json", "--sandbox read-only", "--output-schema", "--output-last-message")
-	assertContainsAll(t, lines[1], "exec resume --json", "--output-schema", "sol-thread -")
-	assertContainsAll(t, lines[2], "exec --json", "--approve-for-me")
-	if strings.Contains(lines[2], "--sandbox") {
-		t.Errorf("Luna invocation contains mutually exclusive sandbox flags: %s", lines[2])
+	solReadOnly := `sandbox_mode="read-only"`
+	lunaWrite := `sandbox_mode="workspace-write"`
+	noApprovals := `approval_policy="never"`
+	assertContainsAll(t, lines[0], "exec --json", solReadOnly, noApprovals, "--output-schema", "--output-last-message")
+	assertContainsAll(t, lines[1], "exec resume --json", solReadOnly, noApprovals, "--output-schema", "sol-thread -")
+	assertContainsAll(t, lines[2], "exec --json", lunaWrite, noApprovals)
+	assertContainsAll(t, lines[3], "exec resume --json", solReadOnly, noApprovals, "--output-schema", "sol-thread -")
+	assertContainsAll(t, lines[4], "exec resume --json", lunaWrite, noApprovals, "luna-thread -")
+	assertContainsAll(t, lines[5], "exec resume --json", solReadOnly, noApprovals, "--output-schema", "sol-thread -")
+	for _, line := range lines {
+		for _, unsafe := range []string{"--approve-for-me", "--dangerously", "danger-full-access"} {
+			if strings.Contains(line, unsafe) {
+				t.Errorf("Codex invocation contains %s: %s", unsafe, line)
+			}
+		}
 	}
-	assertContainsAll(t, lines[3], "exec resume --json", "--output-schema", "sol-thread -")
-	assertContainsAll(t, lines[4], "exec resume --json", "luna-thread -")
-	assertContainsAll(t, lines[5], "exec resume --json", "--output-schema", "sol-thread -")
+	if _, err := os.Stat(lockPath(task.GitCommonDir, task.ID)); !os.IsNotExist(err) {
+		t.Errorf("task lock was not released: %v", err)
+	}
 	for _, name := range []string{"sol-plan-01.jsonl", "sol-plan-02.jsonl"} {
 		if _, err := os.Stat(filepath.Join(task.taskDir(), name)); err != nil {
 			t.Errorf("missing preserved plan evidence %s: %v", name, err)

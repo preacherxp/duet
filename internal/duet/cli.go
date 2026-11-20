@@ -75,6 +75,7 @@ func runStart(ctx context.Context, app *App, args []string, stderr io.Writer) er
 	set.StringVar(&options.WorktreeRoot, "worktree-root", "", "parent directory for isolated task worktrees")
 	set.Var(&checks, "check", "acceptance check command; repeat for multiple checks")
 	set.DurationVar(&options.CheckTimeout, "check-timeout", 10*time.Minute, "timeout for each declared check")
+	set.DurationVar(&options.AgentTimeout, "agent-timeout", DefaultAgentTimeout, "timeout for each Codex invocation (Sol plan or review, Luna round)")
 	set.IntVar(&options.MaxRejections, "max-rejections", 3, "rejected reviews allowed per automatic batch")
 	set.StringVar(&options.SolModel, "sol-model", "", "Codex model override for Sol")
 	set.StringVar(&options.LunaModel, "luna-model", "", "Codex model override for Luna")
@@ -106,10 +107,11 @@ func runApprove(ctx context.Context, app *App, args []string, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
-	task, err := LoadTask(repo, id)
+	task, release, err := LockTask(repo, id)
 	if err != nil {
 		return err
 	}
+	defer release()
 	return app.Approve(ctx, task, feedback)
 }
 
@@ -123,10 +125,11 @@ func runResume(ctx context.Context, app *App, args []string, stderr io.Writer) e
 	if err != nil {
 		return err
 	}
-	task, err := LoadTask(repo, id)
+	task, release, err := LockTask(repo, id)
 	if err != nil {
 		return err
 	}
+	defer release()
 	return app.Resume(ctx, task, feedback)
 }
 
@@ -139,10 +142,11 @@ func runAccept(app *App, args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	task, err := LoadTask(repo, id)
+	task, release, err := LockTask(repo, id)
 	if err != nil {
 		return err
 	}
+	defer release()
 	return app.Accept(task)
 }
 
@@ -168,6 +172,10 @@ func runList(app *App, args []string, stderr io.Writer) error {
 	set.SetOutput(stderr)
 	var repo string
 	set.StringVar(&repo, "repo", ".", "target Git repository")
+	set.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: duet list [options]")
+		set.PrintDefaults()
+	}
 	if err := set.Parse(args); err != nil {
 		return err
 	}

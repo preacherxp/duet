@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Agent interface {
@@ -123,31 +124,7 @@ func invokeCodex(ctx context.Context, task *Task, role, phase, session, model, s
 		}
 	}
 
-	args := []string{"exec"}
-	if session != "" {
-		args = append(args, "resume", "--json")
-		if model != "" {
-			args = append(args, "--model", model)
-		}
-		if schemaPath != "" {
-			args = append(args, "--output-schema", schemaPath)
-		}
-		args = append(args, "--output-last-message", lastMessagePath, session, "-")
-	} else {
-		args = append(args, "--json", "--color", "never", "--cd", task.Worktree)
-		if role == "sol" {
-			args = append(args, "--sandbox", "read-only")
-		} else {
-			args = append(args, "--approve-for-me")
-		}
-		if model != "" {
-			args = append(args, "--model", model)
-		}
-		if schemaPath != "" {
-			args = append(args, "--output-schema", schemaPath)
-		}
-		args = append(args, "--output-last-message", lastMessagePath, "-")
-	}
+	args := codexArgs(task.Worktree, role, session, model, schemaPath, lastMessagePath)
 
 	eventFile, err := os.Create(eventPath)
 	if err != nil {
@@ -158,12 +135,27 @@ func invokeCodex(ctx context.Context, task *Task, role, phase, session, model, s
 		eventFile.Close()
 		return nil, session, fmt.Errorf("create %s %s error log: %w", role, phase, err)
 	}
-	cmd := exec.CommandContext(ctx, task.CodexBin, args...)
+	timeout := task.AgentTimeout
+	if timeout <= 0 {
+		timeout = DefaultAgentTimeout
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, task.CodexBin, args...)
 	cmd.Dir = task.Worktree
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.Stdout = eventFile
 	cmd.Stderr = errorFile
+	// Ask Codex to stop cleanly first; kill it if it has not exited shortly after.
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = 10 * time.Second
 	runErr := cmd.Run()
+	switch {
+	case ctx.Err() != nil:
+		runErr = fmt.Errorf("interrupted: %w", ctx.Err())
+	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
+		runErr = fmt.Errorf("timed out after %s", timeout)
+	}
 	eventSyncErr := eventFile.Sync()
 	errorSyncErr := errorFile.Sync()
 	eventCloseErr := eventFile.Close()
@@ -173,9 +165,9 @@ func invokeCodex(ctx context.Context, task *Task, role, phase, session, model, s
 		session = parsedSession
 	}
 	if runErr != nil {
-		detail := readFileTail(errorPath, 4000)
-		if detail == "" {
-			detail = runErr.Error()
+		detail := runErr.Error()
+		if tail := readFileTail(errorPath, 4000); tail != "" {
+			detail += ": " + tail
 		}
 		return nil, session, fmt.Errorf("%s %s failed: %s (events: %s; stderr: %s)", role, phase, detail, eventPath, errorPath)
 	}
@@ -193,6 +185,40 @@ func invokeCodex(ctx context.Context, task *Task, role, phase, session, model, s
 		return nil, session, fmt.Errorf("read %s %s result: %w", role, phase, err)
 	}
 	return output, session, nil
+}
+
+// codexArgs builds the argument list for one Codex invocation. Sandbox and
+// approval policy are passed on every call, including resumed sessions:
+// `codex exec resume` does not inherit the original session's sandbox and
+// would otherwise fall back to the user's config and project trust level.
+// Sol is read-only; Luna may write only inside the task worktree. Approval
+// requests are never granted, so neither role can escape its sandbox.
+func codexArgs(worktree, role, session, model, schemaPath, lastMessagePath string) []string {
+	sandbox := "read-only"
+	if role == "luna" {
+		sandbox = "workspace-write"
+	}
+	args := []string{"exec"}
+	if session != "" {
+		args = append(args, "resume", "--json")
+	} else {
+		args = append(args, "--json", "--color", "never", "--cd", worktree)
+	}
+	args = append(args,
+		"--config", `sandbox_mode="`+sandbox+`"`,
+		"--config", `approval_policy="never"`,
+	)
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	if schemaPath != "" {
+		args = append(args, "--output-schema", schemaPath)
+	}
+	args = append(args, "--output-last-message", lastMessagePath)
+	if session != "" {
+		args = append(args, session)
+	}
+	return append(args, "-")
 }
 
 func parseThreadID(data []byte) string {

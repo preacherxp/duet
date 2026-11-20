@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"duet/internal/duet"
+	"github.com/preacherxp/duet/internal/duet"
 )
 
 func main() {

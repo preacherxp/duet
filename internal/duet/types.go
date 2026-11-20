@@ -4,6 +4,9 @@ import "time"
 
 const StateVersion = 1
 
+// DefaultAgentTimeout bounds a single Codex invocation when a task does not set one.
+const DefaultAgentTimeout = 2 * time.Hour
+
 type Status string
 
 const (
@@ -78,6 +81,7 @@ type Task struct {
 	CodexBin        string        `json:"codex_bin"`
 	Checks          []string      `json:"checks"`
 	CheckTimeout    time.Duration `json:"check_timeout"`
+	AgentTimeout    time.Duration `json:"agent_timeout,omitempty"`
 	MaxRejections   int           `json:"max_rejections"`
 	BatchRejections int           `json:"batch_rejections"`
 	TotalRejections int           `json:"total_rejections"`
@@ -96,6 +100,7 @@ type StartOptions struct {
 	WorktreeRoot  string
 	Checks        []string
 	CheckTimeout  time.Duration
+	AgentTimeout  time.Duration
 	MaxRejections int
 	SolModel      string
 	LunaModel     string
